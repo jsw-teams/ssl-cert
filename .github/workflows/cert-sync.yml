@@ -45,7 +45,8 @@ jobs:
 
           ROOT_DOMAIN=$(python - <<'PY'
           import yaml
-          with open('config.yml', 'r', encoding='utf-8') as f:
+          import os
+          with open(os.environ["CONFIG_FILE"], 'r', encoding='utf-8') as f:
               cfg = yaml.safe_load(f)
           print(cfg['domain']['root'])
           PY
@@ -53,7 +54,8 @@ jobs:
 
           WILDCARD_DOMAIN=$(python - <<'PY'
           import yaml
-          with open('config.yml', 'r', encoding='utf-8') as f:
+          import os
+          with open(os.environ["CONFIG_FILE"], 'r', encoding='utf-8') as f:
               cfg = yaml.safe_load(f)
           print(cfg['domain']['wildcard'])
           PY
@@ -61,7 +63,8 @@ jobs:
 
           KEY_TYPE=$(python - <<'PY'
           import yaml
-          with open('config.yml', 'r', encoding='utf-8') as f:
+          import os
+          with open(os.environ["CONFIG_FILE"], 'r', encoding='utf-8') as f:
               cfg = yaml.safe_load(f)
           print((cfg.get('cert') or {}).get('key_type', 'ec-256'))
           PY
@@ -182,7 +185,7 @@ jobs:
 
           ~/.acme.sh/acme.sh --set-default-ca --server zerossl
 
-      - name: Issue or renew wildcard certificate with Cloudflare DNS via ZeroSSL
+      - name: Issue or reuse wildcard certificate with Cloudflare DNS via ZeroSSL
         env:
           CF_Token: ${{ secrets.CF_DNS_API_TOKEN }}
         shell: bash
@@ -201,6 +204,14 @@ jobs:
           unset CF_Account_ID
           unset CF_Zone_ID
 
+          if [ "$KEY_TYPE" = "ec-256" ] || [ "$KEY_TYPE" = "ec-384" ]; then
+            CERT_DIR="$HOME/.acme.sh/${ROOT_DOMAIN}_ecc"
+          else
+            CERT_DIR="$HOME/.acme.sh/${ROOT_DOMAIN}"
+          fi
+
+          ACME_RC=0
+          set +e
           ~/.acme.sh/acme.sh --issue \
             --server zerossl \
             --dns dns_cf \
@@ -209,11 +220,20 @@ jobs:
             --keylength "$KEY_TYPE" \
             --dnssleep 120 \
             --debug 2
+          ACME_RC=$?
+          set -e
 
-          if [ "$KEY_TYPE" = "ec-256" ] || [ "$KEY_TYPE" = "ec-384" ]; then
-            CERT_DIR="$HOME/.acme.sh/${ROOT_DOMAIN}_ecc"
+          if [ "$ACME_RC" -ne 0 ] && [ "$ACME_RC" -ne 2 ]; then
+            echo "acme.sh failed with unexpected exit code: $ACME_RC"
+            exit "$ACME_RC"
+          fi
+
+          if [ "$ACME_RC" -eq 2 ]; then
+            echo "acme.sh skipped renewal because the certificate is not due yet."
+            echo "ACME_RENEWED=false" >> "$GITHUB_ENV"
           else
-            CERT_DIR="$HOME/.acme.sh/${ROOT_DOMAIN}"
+            echo "acme.sh issued or renewed the certificate successfully."
+            echo "ACME_RENEWED=true" >> "$GITHUB_ENV"
           fi
 
           test -f "$CERT_DIR/fullchain.cer"
@@ -222,6 +242,7 @@ jobs:
           cp "$CERT_DIR/fullchain.cer" ./fullchain.pem
           cp "$CERT_DIR/${ROOT_DOMAIN}.key" ./privkey.pem
 
+          echo "Using certificate from: $CERT_DIR"
           openssl x509 -in ./fullchain.pem -noout -subject -issuer -serial -dates
 
       - name: Verify generated certificate files
@@ -233,7 +254,7 @@ jobs:
           openssl x509 -in fullchain.pem -noout -text >/dev/null
           openssl pkey -in privkey.pem -noout >/dev/null
 
-      - name: Upload and deploy to clouds
+      - name: Upload or sync certificate to clouds
         env:
           PYTHONPATH: .
           CF_EDGE_API_TOKEN: ${{ secrets.CF_EDGE_API_TOKEN }}
@@ -256,6 +277,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "ACME_RENEWED=${ACME_RENEWED:-unknown}"
           if [ -f run-report.json ]; then
             python -m json.tool run-report.json
           else
