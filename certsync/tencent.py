@@ -53,7 +53,6 @@ class TencentPublisher:
 
     def _describe_same_alias(self, alias: str) -> list[dict[str, Any]]:
         req = models.DescribeCertificatesRequest()
-        # 常见字段：SearchKey / Limit / Offset
         req.from_json_string(
             json.dumps(
                 {
@@ -87,17 +86,27 @@ class TencentPublisher:
                 or item.get("expireTime")
             )
 
-            status = item.get("Status") or item.get("status")
             out.append(
                 {
                     "certificate_id": str(cert_id),
                     "alias": item_alias,
-                    "status": status,
+                    "status": item.get("Status") or item.get("status"),
                     "end_at_raw": end_raw,
                     "end_at": _parse_dt(end_raw),
                 }
             )
         return out
+
+    def _find_same_expiry_remote(self, items: list[dict[str, Any]], target_expiry: str) -> dict[str, Any] | None:
+        target_dt = _parse_dt(target_expiry)
+        if target_dt is None:
+            return None
+
+        for item in items:
+            end_at = item.get("end_at")
+            if end_at == target_dt:
+                return item
+        return None
 
     def _pick_delete_candidate(self, items: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not items:
@@ -167,50 +176,31 @@ class TencentPublisher:
         target_expiry = meta.not_after.isoformat()
         alias = self._fixed_alias()
 
-        if (
-            previous_state.get("deployed_not_after") == target_expiry
-            and previous_state.get("alias") == alias
-        ):
+        remote_same_alias = self._describe_same_alias(alias)
+        remote_same_expiry = self._find_same_expiry_remote(remote_same_alias, target_expiry)
+
+        if remote_same_expiry is not None:
             return ProviderResult(
                 provider="tencent",
                 changed=False,
                 action="skip",
                 detail={
-                    "reason": "same_expiry_and_alias",
+                    "reason": "same_alias_same_expiry_remote_exists",
+                    "certificate_id": remote_same_expiry["certificate_id"],
                     "alias": alias,
                     "deployed_not_after": target_expiry,
                 },
             )
-
-        same_alias = self._describe_same_alias(alias)
-
-        # alias 相同且到期时间相同则直接跳过
-        for item in same_alias:
-            end_at = item.get("end_at")
-            if end_at and end_at.isoformat().replace("+00:00", "Z") == target_expiry.replace("+00:00", "Z"):
-                return ProviderResult(
-                    provider="tencent",
-                    changed=False,
-                    action="skip",
-                    detail={
-                        "reason": "same_alias_same_expiry_already_exists",
-                        "certificate_id": item["certificate_id"],
-                        "alias": alias,
-                        "deployed_not_after": target_expiry,
-                    },
-                )
 
         deleted_old: dict[str, Any] | None = None
 
         try:
             certificate_id, repeat_cert_id = self._upload_certificate(alias, fullchain_pem, private_key_pem)
         except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
             if not self.config.get("delete_on_alias_conflict", True):
                 raise
 
-            # 如果未来真的出现 alias 层面的重复限制，就删掉最早到期的同 alias 旧证书再重试
-            candidate = self._pick_delete_candidate(same_alias)
+            candidate = self._pick_delete_candidate(remote_same_alias)
             if candidate is None:
                 raise
 
