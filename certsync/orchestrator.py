@@ -6,7 +6,7 @@ from certsync.aliyun import AliyunPublisher
 from certsync.cloudflare import CloudflarePublisher
 from certsync.state import StateStore
 from certsync.tencent import TencentPublisher
-from certsync.utils import RunReport
+from certsync.utils import ProviderResult, RunReport
 from certsync.x509util import parse_certificate_meta, read_text
 
 
@@ -41,15 +41,38 @@ class Orchestrator:
         if (self.config.get("tencent") or {}).get("enabled"):
             providers.append(("tencent", TencentPublisher(self.config["tencent"]), self.config["tencent"]))
 
+        had_error = False
+
         for name, publisher, _cfg in providers:
             previous_state = self.state.get_provider(name)
-            result = publisher.publish(fullchain_pem, private_key_pem, meta, previous_state)
-            report.add(result)
-            if result.changed:
-                self.state.set_provider(name, result.detail)
+            try:
+                result = publisher.publish(fullchain_pem, private_key_pem, meta, previous_state)
+                report.add(result)
+
+                if result.changed:
+                    self.state.set_provider(name, result.detail)
+                    self.state.save()
+
+            except Exception as exc:  # noqa: BLE001
+                had_error = True
+                report.add(
+                    ProviderResult(
+                        provider=name,
+                        changed=False,
+                        action="error",
+                        detail={"error": str(exc)},
+                    )
+                )
+                # 即使失败，也把当前已成功的 provider 状态和错误报告先落盘
+                self.state.save()
+                report.write(output_path)
 
         self.state.save()
         report.write(output_path)
+
+        if had_error:
+            raise RuntimeError("One or more cloud providers failed. Check run-report.json for details.")
+
         return {
             "certificate": report.certificate,
             "providers": report.providers,
