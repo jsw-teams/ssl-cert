@@ -74,7 +74,6 @@ class CloudflarePublisher:
             expires_on = _parse_cf_time(item.get("expires_on")) or datetime.max.replace(tzinfo=timezone.utc)
             uploaded_on = _parse_cf_time(item.get("uploaded_on")) or datetime.max.replace(tzinfo=timezone.utc)
 
-            # 已过期优先；active 再优先；之后最早到期优先
             expired_rank = 0 if expires_on <= now else 1
             active_rank = 0 if status == "active" else 1
             return (expired_rank, active_rank, expires_on, uploaded_on)
@@ -127,33 +126,33 @@ class CloudflarePublisher:
 
         return None, "none"
 
-    def _pick_delete_candidate_for_quota(
+    def _find_uploaded_target(
         self,
         existing_items: list[dict[str, Any]],
         wanted_hosts: list[str],
-    ) -> tuple[dict[str, Any] | None, str]:
-        """
-        quota 触发时，只删除和目标 hosts 相关的旧证书。
-        不删除无关证书，避免误伤其他域名。
-        """
-        return self._find_best_existing(existing_items, wanted_hosts)
-
-    @staticmethod
-    def _is_same_target_cert(
-        item: dict[str, Any],
-        wanted_hosts: list[str],
         target_expiry: str,
         target_issuer: str,
-    ) -> bool:
-        item_hosts = sorted([str(x).strip().lower() for x in (item.get("hosts") or []) if str(x).strip()])
-        wanted = sorted([str(x).strip().lower() for x in wanted_hosts if str(x).strip()])
-        item_expiry = str(item.get("expires_on") or "").replace("Z", "+00:00")
-        target_expiry_norm = str(target_expiry).replace("Z", "+00:00")
-        item_issuer = str(item.get("issuer") or "").strip()
-        return item_hosts == wanted and item_expiry == target_expiry_norm and item_issuer == target_issuer
+    ) -> dict[str, Any] | None:
+        wanted = sorted(self._norm_hosts(wanted_hosts))
+        target_expiry_dt = _parse_cf_time(target_expiry)
 
-    def _delete_certificate(self, custom_certificate_id: str) -> None:
-        self._request("DELETE", f"{self.base_url}/{custom_certificate_id}")
+        for item in existing_items:
+            item_hosts = sorted(self._norm_hosts(item.get("hosts")))
+            if item_hosts != wanted:
+                continue
+
+            item_expiry = _parse_cf_time(item.get("expires_on"))
+            item_issuer = str(item.get("issuer") or "").strip()
+
+            if item_expiry == target_expiry_dt and item_issuer == target_issuer:
+                return item
+
+        return None
+
+    @staticmethod
+    def _is_quota_error(exc: Exception) -> bool:
+        msg = str(exc)
+        return "code': 2005" in msg or '"code": 2005' in msg
 
     def publish(
         self,
@@ -169,7 +168,6 @@ class CloudflarePublisher:
         if not wanted_hosts:
             wanted_hosts = meta.san_dns_names
 
-        # state 命中时直接跳过
         if (
             previous_state.get("deployed_not_after") == target_expiry
             and previous_state.get("deployed_issuer") == target_issuer
@@ -189,21 +187,21 @@ class CloudflarePublisher:
 
         existing_items = self._list_existing()
 
-        # 即使 state 丢了，只要 Cloudflare 已经有同目标证书，也直接跳过
-        for item in existing_items:
-            if self._is_same_target_cert(item, wanted_hosts, target_expiry, target_issuer):
-                return ProviderResult(
-                    provider="cloudflare",
-                    changed=False,
-                    action="skip",
-                    detail={
-                        "reason": "same_hosts_same_expiry_same_issuer_already_exists",
-                        "custom_certificate_id": item.get("id"),
-                        "hosts": wanted_hosts,
-                        "deployed_not_after": target_expiry,
-                        "deployed_issuer": target_issuer,
-                    },
-                )
+        # state 丢失时，若 Cloudflare 已经是目标证书，也直接视为成功
+        already = self._find_uploaded_target(existing_items, wanted_hosts, target_expiry, target_issuer)
+        if already is not None:
+            return ProviderResult(
+                provider="cloudflare",
+                changed=False,
+                action="skip",
+                detail={
+                    "reason": "same_hosts_same_expiry_same_issuer_already_exists",
+                    "custom_certificate_id": already.get("id"),
+                    "hosts": wanted_hosts,
+                    "deployed_not_after": target_expiry,
+                    "deployed_issuer": target_issuer,
+                },
+            )
 
         patch_payload = {
             "certificate": extract_leaf_certificate(fullchain_pem),
@@ -217,9 +215,8 @@ class CloudflarePublisher:
         }
 
         existing, match_mode = self._find_best_existing(existing_items, wanted_hosts)
-        deleted_old: dict[str, Any] | None = None
 
-        # 1) 优先更新已有旧证书（哪怕旧 issuer 是 Google）
+        # 优先更新旧证书
         if existing is not None:
             cert_id = str(existing["id"])
             try:
@@ -237,38 +234,33 @@ class CloudflarePublisher:
                         "hosts": wanted_hosts,
                         "deployed_not_after": target_expiry,
                         "deployed_issuer": target_issuer,
-                        "deleted_old": None,
                     },
                 )
             except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                # PATCH 也可能因 quota 失败；此时删掉这一张旧目标证书，再创建新证书
-                if ("code': 2005" in msg or '"code": 2005' in msg) and self.config.get("delete_on_quota", True):
-                    self._delete_certificate(cert_id)
-                    deleted_old = {
-                        "custom_certificate_id": cert_id,
-                        "issuer": existing.get("issuer"),
-                        "expires_on": existing.get("expires_on"),
-                        "hosts": existing.get("hosts"),
-                        "reason": "quota_reached_on_patch",
-                    }
-                    result = self._request("POST", self.base_url, json=create_payload)["result"]
+                if not self._is_quota_error(exc):
+                    raise
+
+                # quota 之后立刻复查最终状态；若目标证书已存在，则按成功处理
+                reloaded = self._list_existing()
+                verified = self._find_uploaded_target(reloaded, wanted_hosts, target_expiry, target_issuer)
+                if verified is not None:
                     return ProviderResult(
                         provider="cloudflare",
                         changed=True,
-                        action="delete_old_and_create",
+                        action="verified_after_quota_on_update",
                         detail={
-                            "custom_certificate_id": result.get("id"),
+                            "custom_certificate_id": verified.get("id"),
+                            "matched_existing_id": cert_id,
                             "match_mode": match_mode,
                             "hosts": wanted_hosts,
                             "deployed_not_after": target_expiry,
                             "deployed_issuer": target_issuer,
-                            "deleted_old": deleted_old,
+                            "message": "Cloudflare returned quota error, but post-check confirms the target certificate is already present.",
                         },
                     )
                 raise
 
-        # 2) 完全找不到相关旧证书时，才尝试创建
+        # 找不到旧证书时才创建
         try:
             result = self._request("POST", self.base_url, json=create_payload)["result"]
             return ProviderResult(
@@ -281,39 +273,26 @@ class CloudflarePublisher:
                     "hosts": wanted_hosts,
                     "deployed_not_after": target_expiry,
                     "deployed_issuer": target_issuer,
-                    "deleted_old": None,
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
-            if ("code': 2005" in msg or '"code": 2005' in msg) and self.config.get("delete_on_quota", True):
-                candidate, candidate_mode = self._pick_delete_candidate_for_quota(existing_items, wanted_hosts)
-                if candidate is None:
-                    raise RuntimeError(
-                        "Cloudflare quota reached, and no related old custom certificate was found to delete safely."
-                    ) from exc
+            if not self._is_quota_error(exc):
+                raise
 
-                cert_id = str(candidate["id"])
-                self._delete_certificate(cert_id)
-                deleted_old = {
-                    "custom_certificate_id": cert_id,
-                    "issuer": candidate.get("issuer"),
-                    "expires_on": candidate.get("expires_on"),
-                    "hosts": candidate.get("hosts"),
-                    "reason": "quota_reached_on_create",
-                }
-                result = self._request("POST", self.base_url, json=create_payload)["result"]
+            reloaded = self._list_existing()
+            verified = self._find_uploaded_target(reloaded, wanted_hosts, target_expiry, target_issuer)
+            if verified is not None:
                 return ProviderResult(
                     provider="cloudflare",
                     changed=True,
-                    action="delete_old_and_create",
+                    action="verified_after_quota_on_create",
                     detail={
-                        "custom_certificate_id": result.get("id"),
-                        "match_mode": candidate_mode,
+                        "custom_certificate_id": verified.get("id"),
+                        "match_mode": "created_new",
                         "hosts": wanted_hosts,
                         "deployed_not_after": target_expiry,
                         "deployed_issuer": target_issuer,
-                        "deleted_old": deleted_old,
+                        "message": "Cloudflare returned quota error, but post-check confirms the target certificate is already present.",
                     },
                 )
             raise
