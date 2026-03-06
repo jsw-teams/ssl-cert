@@ -18,26 +18,15 @@ def _parse_dt(value: Any) -> datetime | None:
     if not s:
         return None
 
-    # 常见格式兼容：
-    # 2026-06-04T23:59:59Z
-    # 2026-06-04 23:59:59
-    # 2026-06-04
-    fmts = [
-        None,  # fromisoformat
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ]
-
     s2 = s.replace("Z", "+00:00")
     try:
         return datetime.fromisoformat(s2).astimezone(timezone.utc)
     except ValueError:
         pass
 
-    for fmt in fmts[1:]:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     return None
@@ -79,9 +68,8 @@ class AliyunPublisher:
             current_page=1,
         )
         resp = self.client.list_user_certificate_order(req)
-
-        # Tea 模型用 to_map 取值更稳
         body = resp.body.to_map() if hasattr(resp.body, "to_map") else {}
+
         items = body.get("CertificateOrderList") or body.get("certificateOrderList") or []
 
         out: list[dict[str, Any]] = []
@@ -94,9 +82,7 @@ class AliyunPublisher:
             if cert_id is None:
                 continue
 
-            expired = item.get("Expired")
-            # 文档里有 Expired 字段；到期时间字段不同版本返回名不完全一致，尽量兼容
-            end_at = (
+            end_at_raw = (
                 item.get("EndDate")
                 or item.get("endDate")
                 or item.get("EndTime")
@@ -109,13 +95,24 @@ class AliyunPublisher:
                 {
                     "cert_id": int(cert_id),
                     "name": name,
-                    "expired": bool(expired),
-                    "end_at_raw": end_at,
-                    "end_at": _parse_dt(end_at),
+                    "expired": bool(item.get("Expired")),
+                    "end_at_raw": end_at_raw,
+                    "end_at": _parse_dt(end_at_raw),
                     "status": item.get("Status") or item.get("status"),
                 }
             )
         return out
+
+    def _find_same_expiry_remote(self, items: list[dict[str, Any]], target_expiry: str) -> dict[str, Any] | None:
+        target_dt = _parse_dt(target_expiry)
+        if target_dt is None:
+            return None
+
+        for item in items:
+            end_at = item.get("end_at")
+            if end_at == target_dt:
+                return item
+        return None
 
     def _pick_delete_candidate(self, items: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not items:
@@ -124,7 +121,6 @@ class AliyunPublisher:
         now = datetime.now(timezone.utc)
 
         def sort_key(item: dict[str, Any]) -> tuple[int, datetime]:
-            # 已过期优先删除；否则删最早过期的
             expired = bool(item.get("expired"))
             end_at = item.get("end_at") or datetime.max.replace(tzinfo=timezone.utc)
             expired_rank = 0 if expired or end_at <= now else 1
@@ -173,41 +169,23 @@ class AliyunPublisher:
         target_expiry = meta.not_after.isoformat()
         cert_name = self._fixed_cert_name()
 
-        # 如果 state 已记录同到期时间且名称一致，直接跳过
-        if (
-            previous_state.get("deployed_not_after") == target_expiry
-            and previous_state.get("cert_name") == cert_name
-        ):
+        remote_same_name = self._list_uploaded_by_name(cert_name)
+        remote_same_expiry = self._find_same_expiry_remote(remote_same_name, target_expiry)
+
+        # 只以“远端真的存在”为准，不再用 state 直接 skip
+        if remote_same_expiry is not None:
             return ProviderResult(
                 provider="aliyun",
                 changed=False,
                 action="skip",
                 detail={
-                    "reason": "same_expiry_and_name",
+                    "reason": "same_name_same_expiry_remote_exists",
+                    "cert_id": remote_same_expiry["cert_id"],
                     "cert_name": cert_name,
                     "deployed_not_after": target_expiry,
                     "cert_region": self.config.get("cert_region", "ap-southeast-1"),
                 },
             )
-
-        existing_same_name = self._list_uploaded_by_name(cert_name)
-
-        # 如果同名里已经有同到期时间的证书，直接复用，不重复上传
-        for item in existing_same_name:
-            end_at = item.get("end_at")
-            if end_at and end_at.isoformat().replace("+00:00", "Z") == target_expiry.replace("+00:00", "Z"):
-                return ProviderResult(
-                    provider="aliyun",
-                    changed=False,
-                    action="skip",
-                    detail={
-                        "reason": "same_name_same_expiry_already_exists",
-                        "cert_id": item["cert_id"],
-                        "cert_name": cert_name,
-                        "deployed_not_after": target_expiry,
-                        "cert_region": self.config.get("cert_region", "ap-southeast-1"),
-                    },
-                )
 
         deleted_old: dict[str, Any] | None = None
 
@@ -218,7 +196,7 @@ class AliyunPublisher:
             if "NameRepeat" not in msg or not self.config.get("delete_on_name_repeat", True):
                 raise
 
-            candidate = self._pick_delete_candidate(existing_same_name)
+            candidate = self._pick_delete_candidate(remote_same_name)
             if candidate is None:
                 raise RuntimeError(
                     f"Aliyun returned NameRepeat for '{cert_name}', but no same-name uploaded certificate was found."
@@ -226,7 +204,6 @@ class AliyunPublisher:
 
             self._delete_certificate(candidate["cert_id"])
             deleted_old = candidate
-
             cert_id = self._upload_certificate(cert_name, fullchain_pem, private_key_pem)
 
         jobs: list[dict[str, Any]] = []
