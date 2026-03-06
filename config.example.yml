@@ -18,31 +18,24 @@ cloudflare:
 
 aliyun:
   enabled: true
-  certificate_name_prefix: jsw-ac-cn-zerossl
+  # 名称固定，不再追加时间戳
+  certificate_name: jsw-ac-cn-zerossl
+  # 说明：上传 API 本身不显式带 cert_region，但国际站账号下游产品引用 CAS 证书时请使用 ap-southeast-1
+  cert_region: ap-southeast-1
+  endpoint: cas.aliyuncs.com
+  delete_on_name_repeat: true
   deploy:
     enabled: false
     contact_ids: []
     schedule_time: ''
     resources: []
-    # - cloud_name: aliyun
-    #   cloud_product: CDN
-    #   resource_ids: ['1234567']
-    # - cloud_name: aliyun
-    #   cloud_product: ALB
-    #   resource_ids: ['7654321']
 
 tencent:
   enabled: true
-  alias_prefix: jsw-ac-cn-zerossl
+  # 别名固定，不再追加时间戳
+  alias_name: jsw-ac-cn-zerossl
   project_id: 0
+  delete_on_alias_conflict: true
   deploy:
     enabled: false
     resources: []
-    # - resource_type: teo
-    #   region: ''
-    #   instance_id_list:
-    #     - example.com
-    # - resource_type: clb
-    #   region: ap-guangzhou
-    #   instance_id_list:
-    #     - lb-xxxxxxxx|lbl-yyyyyyyy|example.com
