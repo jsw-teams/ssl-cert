@@ -11,6 +11,38 @@ from certsync.utils import ProviderResult, join_csv_str, required_env
 from certsync.x509util import CertificateMeta
 
 
+def _parse_dt(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # 常见格式兼容：
+    # 2026-06-04T23:59:59Z
+    # 2026-06-04 23:59:59
+    # 2026-06-04
+    fmts = [
+        None,  # fromisoformat
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ]
+
+    s2 = s.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s2).astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in fmts[1:]:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 class AliyunPublisher:
     def __init__(self, config: dict[str, Any]) -> None:
         access_key_id = required_env("ALIBABA_CLOUD_ACCESS_KEY_ID")
@@ -20,15 +52,12 @@ class AliyunPublisher:
             access_key_id=access_key_id,
             access_key_secret=access_key_secret,
         )
-        openapi.endpoint = "cas.aliyuncs.com"
+        openapi.endpoint = str(config.get("endpoint") or "cas.aliyuncs.com")
         self.client = CasClient(openapi)
         self.config = config
 
-    def _build_unique_cert_name(self, meta: CertificateMeta) -> str:
-        prefix = str(self.config.get("certificate_name_prefix") or "jsw-ac-cn-zerossl")
-        # 证书名称在阿里云账号内必须唯一，因此这里追加 UTC 时间戳，避免 NameRepeat
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        return f"{prefix}-{meta.not_after.strftime('%Y%m%d')}-{meta.sha256[:12]}-{ts}"
+    def _fixed_cert_name(self) -> str:
+        return str(self.config.get("certificate_name") or "jsw-ac-cn-zerossl").strip()
 
     def _upload_certificate(self, cert_name: str, fullchain_pem: str, private_key_pem: str) -> int:
         req = cas_models.UploadUserCertificateRequest(
@@ -41,6 +70,71 @@ class AliyunPublisher:
         if cert_id is None:
             raise RuntimeError("Aliyun upload_user_certificate returned no cert_id")
         return int(cert_id)
+
+    def _list_uploaded_by_name(self, cert_name: str) -> list[dict[str, Any]]:
+        req = cas_models.ListUserCertificateOrderRequest(
+            order_type="UPLOAD",
+            keyword=cert_name,
+            show_size=100,
+            current_page=1,
+        )
+        resp = self.client.list_user_certificate_order(req)
+
+        # Tea 模型用 to_map 取值更稳
+        body = resp.body.to_map() if hasattr(resp.body, "to_map") else {}
+        items = body.get("CertificateOrderList") or body.get("certificateOrderList") or []
+
+        out: list[dict[str, Any]] = []
+        for item in items:
+            name = str(item.get("Name") or item.get("name") or "").strip()
+            if name != cert_name:
+                continue
+
+            cert_id = item.get("CertId") or item.get("certId")
+            if cert_id is None:
+                continue
+
+            expired = item.get("Expired")
+            # 文档里有 Expired 字段；到期时间字段不同版本返回名不完全一致，尽量兼容
+            end_at = (
+                item.get("EndDate")
+                or item.get("endDate")
+                or item.get("EndTime")
+                or item.get("endTime")
+                or item.get("ExpireTime")
+                or item.get("expireTime")
+            )
+
+            out.append(
+                {
+                    "cert_id": int(cert_id),
+                    "name": name,
+                    "expired": bool(expired),
+                    "end_at_raw": end_at,
+                    "end_at": _parse_dt(end_at),
+                    "status": item.get("Status") or item.get("status"),
+                }
+            )
+        return out
+
+    def _pick_delete_candidate(self, items: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not items:
+            return None
+
+        now = datetime.now(timezone.utc)
+
+        def sort_key(item: dict[str, Any]) -> tuple[int, datetime]:
+            # 已过期优先删除；否则删最早过期的
+            expired = bool(item.get("expired"))
+            end_at = item.get("end_at") or datetime.max.replace(tzinfo=timezone.utc)
+            expired_rank = 0 if expired or end_at <= now else 1
+            return (expired_rank, end_at)
+
+        return sorted(items, key=sort_key)[0]
+
+    def _delete_certificate(self, cert_id: int) -> None:
+        req = cas_models.DeleteUserCertificateRequest(cert_id=cert_id)
+        self.client.delete_user_certificate(req)
 
     def _create_deployment_job(
         self,
@@ -77,18 +171,63 @@ class AliyunPublisher:
         previous_state: dict[str, Any],
     ) -> ProviderResult:
         target_expiry = meta.not_after.isoformat()
+        cert_name = self._fixed_cert_name()
 
-        # state 中已有同到期时间则直接跳过
-        if previous_state.get("deployed_not_after") == target_expiry:
+        # 如果 state 已记录同到期时间且名称一致，直接跳过
+        if (
+            previous_state.get("deployed_not_after") == target_expiry
+            and previous_state.get("cert_name") == cert_name
+        ):
             return ProviderResult(
                 provider="aliyun",
                 changed=False,
                 action="skip",
-                detail={"reason": "same_expiry", "deployed_not_after": target_expiry},
+                detail={
+                    "reason": "same_expiry_and_name",
+                    "cert_name": cert_name,
+                    "deployed_not_after": target_expiry,
+                    "cert_region": self.config.get("cert_region", "ap-southeast-1"),
+                },
             )
 
-        cert_name = self._build_unique_cert_name(meta)
-        cert_id = self._upload_certificate(cert_name, fullchain_pem, private_key_pem)
+        existing_same_name = self._list_uploaded_by_name(cert_name)
+
+        # 如果同名里已经有同到期时间的证书，直接复用，不重复上传
+        for item in existing_same_name:
+            end_at = item.get("end_at")
+            if end_at and end_at.isoformat().replace("+00:00", "Z") == target_expiry.replace("+00:00", "Z"):
+                return ProviderResult(
+                    provider="aliyun",
+                    changed=False,
+                    action="skip",
+                    detail={
+                        "reason": "same_name_same_expiry_already_exists",
+                        "cert_id": item["cert_id"],
+                        "cert_name": cert_name,
+                        "deployed_not_after": target_expiry,
+                        "cert_region": self.config.get("cert_region", "ap-southeast-1"),
+                    },
+                )
+
+        deleted_old: dict[str, Any] | None = None
+
+        try:
+            cert_id = self._upload_certificate(cert_name, fullchain_pem, private_key_pem)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "NameRepeat" not in msg or not self.config.get("delete_on_name_repeat", True):
+                raise
+
+            candidate = self._pick_delete_candidate(existing_same_name)
+            if candidate is None:
+                raise RuntimeError(
+                    f"Aliyun returned NameRepeat for '{cert_name}', but no same-name uploaded certificate was found."
+                ) from exc
+
+            self._delete_certificate(candidate["cert_id"])
+            deleted_old = candidate
+
+            cert_id = self._upload_certificate(cert_name, fullchain_pem, private_key_pem)
 
         jobs: list[dict[str, Any]] = []
         deploy_cfg = self.config.get("deploy") or {}
@@ -102,13 +241,7 @@ class AliyunPublisher:
                 if not resource_ids:
                     continue
 
-                job_name = (
-                    f"{self.config.get('certificate_name_prefix', 'jsw-ac-cn-zerossl')}-"
-                    f"{item.get('cloud_name', 'aliyun')}-"
-                    f"{item.get('cloud_product', 'resource')}-"
-                    f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-                )
-
+                job_name = f"{cert_name}-deploy"
                 job_id = self._create_deployment_job(
                     name=job_name,
                     cert_id=cert_id,
@@ -134,6 +267,8 @@ class AliyunPublisher:
                 "cert_id": cert_id,
                 "cert_name": cert_name,
                 "deployed_not_after": target_expiry,
+                "cert_region": self.config.get("cert_region", "ap-southeast-1"),
+                "deleted_old": deleted_old,
                 "jobs": jobs,
             },
         )
