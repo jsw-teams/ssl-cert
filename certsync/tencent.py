@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from tencentcloud.common import credential
@@ -10,6 +11,27 @@ from tencentcloud.ssl.v20191205 import models, ssl_client
 
 from certsync.utils import ProviderResult, required_env
 from certsync.x509util import CertificateMeta
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+
+    s2 = s.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s2).astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 class TencentPublisher:
@@ -25,6 +47,75 @@ class TencentPublisher:
         profile = ClientProfile()
         profile.httpProfile = http_profile
         return ssl_client.SslClient(self.cred, region, profile)
+
+    def _fixed_alias(self) -> str:
+        return str(self.config.get("alias_name") or "jsw-ac-cn-zerossl").strip()
+
+    def _describe_same_alias(self, alias: str) -> list[dict[str, Any]]:
+        req = models.DescribeCertificatesRequest()
+        # 常见字段：SearchKey / Limit / Offset
+        req.from_json_string(
+            json.dumps(
+                {
+                    "SearchKey": alias,
+                    "Limit": 100,
+                    "Offset": 0,
+                }
+            )
+        )
+        resp = self._client("").DescribeCertificates(req)
+        data = json.loads(resp.to_json_string())
+
+        items = data.get("Certificates") or data.get("Response", {}).get("Certificates") or []
+        out: list[dict[str, Any]] = []
+
+        for item in items:
+            item_alias = str(item.get("Alias") or item.get("alias") or "").strip()
+            if item_alias != alias:
+                continue
+
+            cert_id = item.get("CertificateId") or item.get("certificateId")
+            if not cert_id:
+                continue
+
+            end_raw = (
+                item.get("EndTime")
+                or item.get("endTime")
+                or item.get("CertEndTime")
+                or item.get("certEndTime")
+                or item.get("ExpireTime")
+                or item.get("expireTime")
+            )
+
+            status = item.get("Status") or item.get("status")
+            out.append(
+                {
+                    "certificate_id": str(cert_id),
+                    "alias": item_alias,
+                    "status": status,
+                    "end_at_raw": end_raw,
+                    "end_at": _parse_dt(end_raw),
+                }
+            )
+        return out
+
+    def _pick_delete_candidate(self, items: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not items:
+            return None
+
+        now = datetime.now(timezone.utc)
+
+        def sort_key(item: dict[str, Any]) -> tuple[int, datetime]:
+            end_at = item.get("end_at") or datetime.max.replace(tzinfo=timezone.utc)
+            expired_rank = 0 if end_at <= now else 1
+            return (expired_rank, end_at)
+
+        return sorted(items, key=sort_key)[0]
+
+    def _delete_certificate(self, certificate_id: str) -> None:
+        req = models.DeleteCertificateRequest()
+        req.from_json_string(json.dumps({"CertificateId": certificate_id}))
+        self._client("").DeleteCertificate(req)
 
     def _upload_certificate(self, alias: str, fullchain_pem: str, private_key_pem: str) -> tuple[str, str]:
         req = models.UploadCertificateRequest()
@@ -74,17 +165,58 @@ class TencentPublisher:
         previous_state: dict[str, Any],
     ) -> ProviderResult:
         target_expiry = meta.not_after.isoformat()
-        if previous_state.get("deployed_not_after") == target_expiry:
+        alias = self._fixed_alias()
+
+        if (
+            previous_state.get("deployed_not_after") == target_expiry
+            and previous_state.get("alias") == alias
+        ):
             return ProviderResult(
                 provider="tencent",
                 changed=False,
                 action="skip",
-                detail={"reason": "same_expiry", "deployed_not_after": target_expiry},
+                detail={
+                    "reason": "same_expiry_and_alias",
+                    "alias": alias,
+                    "deployed_not_after": target_expiry,
+                },
             )
 
-        alias_prefix = str(self.config.get("alias_prefix") or "jsw-ac-cn-zerossl")
-        alias = f"{alias_prefix}-{meta.not_after.strftime('%Y%m%d')}-{meta.sha256[:12]}"
-        certificate_id, repeat_cert_id = self._upload_certificate(alias, fullchain_pem, private_key_pem)
+        same_alias = self._describe_same_alias(alias)
+
+        # alias 相同且到期时间相同则直接跳过
+        for item in same_alias:
+            end_at = item.get("end_at")
+            if end_at and end_at.isoformat().replace("+00:00", "Z") == target_expiry.replace("+00:00", "Z"):
+                return ProviderResult(
+                    provider="tencent",
+                    changed=False,
+                    action="skip",
+                    detail={
+                        "reason": "same_alias_same_expiry_already_exists",
+                        "certificate_id": item["certificate_id"],
+                        "alias": alias,
+                        "deployed_not_after": target_expiry,
+                    },
+                )
+
+        deleted_old: dict[str, Any] | None = None
+
+        try:
+            certificate_id, repeat_cert_id = self._upload_certificate(alias, fullchain_pem, private_key_pem)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if not self.config.get("delete_on_alias_conflict", True):
+                raise
+
+            # 如果未来真的出现 alias 层面的重复限制，就删掉最早到期的同 alias 旧证书再重试
+            candidate = self._pick_delete_candidate(same_alias)
+            if candidate is None:
+                raise
+
+            self._delete_certificate(candidate["certificate_id"])
+            deleted_old = candidate
+            certificate_id, repeat_cert_id = self._upload_certificate(alias, fullchain_pem, private_key_pem)
 
         deployments: list[dict[str, Any]] = []
         deploy_cfg = self.config.get("deploy") or {}
@@ -103,6 +235,7 @@ class TencentPublisher:
                 "repeat_cert_id": repeat_cert_id,
                 "alias": alias,
                 "deployed_not_after": target_expiry,
+                "deleted_old": deleted_old,
                 "deployments": deployments,
             },
         )
