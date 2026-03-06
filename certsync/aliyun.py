@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from alibabacloud_cas20200407 import models as cas_models
@@ -22,6 +23,12 @@ class AliyunPublisher:
         openapi.endpoint = "cas.aliyuncs.com"
         self.client = CasClient(openapi)
         self.config = config
+
+    def _build_unique_cert_name(self, meta: CertificateMeta) -> str:
+        prefix = str(self.config.get("certificate_name_prefix") or "jsw-ac-cn-zerossl")
+        # 证书名称在阿里云账号内必须唯一，因此这里追加 UTC 时间戳，避免 NameRepeat
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"{prefix}-{meta.not_after.strftime('%Y%m%d')}-{meta.sha256[:12]}-{ts}"
 
     def _upload_certificate(self, cert_name: str, fullchain_pem: str, private_key_pem: str) -> int:
         req = cas_models.UploadUserCertificateRequest(
@@ -70,6 +77,8 @@ class AliyunPublisher:
         previous_state: dict[str, Any],
     ) -> ProviderResult:
         target_expiry = meta.not_after.isoformat()
+
+        # state 中已有同到期时间则直接跳过
         if previous_state.get("deployed_not_after") == target_expiry:
             return ProviderResult(
                 provider="aliyun",
@@ -78,8 +87,7 @@ class AliyunPublisher:
                 detail={"reason": "same_expiry", "deployed_not_after": target_expiry},
             )
 
-        prefix = str(self.config.get("certificate_name_prefix") or "jsw-ac-cn-zerossl")
-        cert_name = f"{prefix}-{meta.not_after.strftime('%Y%m%d')}-{meta.sha256[:12]}"
+        cert_name = self._build_unique_cert_name(meta)
         cert_id = self._upload_certificate(cert_name, fullchain_pem, private_key_pem)
 
         jobs: list[dict[str, Any]] = []
@@ -88,14 +96,19 @@ class AliyunPublisher:
             contact_ids = list(deploy_cfg.get("contact_ids") or [])
             if not contact_ids:
                 raise RuntimeError("Aliyun deploy.enabled=true requires deploy.contact_ids")
+
             for item in deploy_cfg.get("resources") or []:
                 resource_ids = list(item.get("resource_ids") or [])
                 if not resource_ids:
                     continue
+
                 job_name = (
-                    f"{prefix}-{item.get('cloud_name', 'aliyun')}-"
-                    f"{item.get('cloud_product', 'resource')}-{meta.not_after.strftime('%Y%m%d')}"
+                    f"{self.config.get('certificate_name_prefix', 'jsw-ac-cn-zerossl')}-"
+                    f"{item.get('cloud_name', 'aliyun')}-"
+                    f"{item.get('cloud_product', 'resource')}-"
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
                 )
+
                 job_id = self._create_deployment_job(
                     name=job_name,
                     cert_id=cert_id,
