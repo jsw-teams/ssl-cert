@@ -22,7 +22,7 @@ aliyun:
   certificate_name: jsw-ac-cn-zerossl
   # 说明：上传 API 本身不显式带 cert_region，但国际站账号下游产品引用 CAS 证书时请使用 ap-southeast-1
   cert_region: ap-southeast-1
-  endpoint: cas.aliyuncs.com
+  endpoint: cas.ap-southeast-1.aliyuncs.com
   delete_on_name_repeat: true
   deploy:
     enabled: false
