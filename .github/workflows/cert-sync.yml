@@ -1,0 +1,294 @@
+name: issue-and-sync-jsw-ac-cn-cert
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '18 2 1,15 * *'
+
+permissions:
+  contents: read
+
+jobs:
+  sync-cert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ACME_EMAIL: certbot@jsw.ac.cn
+      CONFIG_FILE: config.yml
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy example config if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$CONFIG_FILE" || cp config.example.yml "$CONFIG_FILE"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Load config values
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT_DOMAIN=$(python - <<'PY'
+          import yaml
+          with open('config.yml', 'r', encoding='utf-8') as f:
+              cfg = yaml.safe_load(f)
+          print(cfg['domain']['root'])
+          PY
+          )
+
+          WILDCARD_DOMAIN=$(python - <<'PY'
+          import yaml
+          with open('config.yml', 'r', encoding='utf-8') as f:
+              cfg = yaml.safe_load(f)
+          print(cfg['domain']['wildcard'])
+          PY
+          )
+
+          KEY_TYPE=$(python - <<'PY'
+          import yaml
+          with open('config.yml', 'r', encoding='utf-8') as f:
+              cfg = yaml.safe_load(f)
+          print((cfg.get('cert') or {}).get('key_type', 'ec-256'))
+          PY
+          )
+
+          echo "ROOT_DOMAIN=$ROOT_DOMAIN" >> "$GITHUB_ENV"
+          echo "WILDCARD_DOMAIN=$WILDCARD_DOMAIN" >> "$GITHUB_ENV"
+          echo "KEY_TYPE=$KEY_TYPE" >> "$GITHUB_ENV"
+
+      - name: Restore acme.sh cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.acme.sh
+          key: acmesh-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            acmesh-${{ github.repository }}-${{ github.ref_name }}-
+
+      - name: Restore certsync state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: certsync-state-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            certsync-state-${{ github.repository }}-${{ github.ref_name }}-
+
+      - name: Install acme.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://get.acme.sh | sh -s email="$ACME_EMAIL"
+
+      - name: Verify Cloudflare DNS token
+        env:
+          CF_Token: ${{ secrets.CF_DNS_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLEAN_CF_TOKEN="$(printf '%s' "$CF_Token" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          case "$CLEAN_CF_TOKEN" in
+            Bearer\ *|bearer\ *)
+              echo "CF_DNS_API_TOKEN secret must not include the 'Bearer ' prefix."
+              exit 1
+              ;;
+          esac
+
+          http_code=$(curl -sS \
+            -o cf-token-verify.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer $CLEAN_CF_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/user/tokens/verify")
+
+          echo "Cloudflare token verify HTTP status: $http_code"
+          cat cf-token-verify.json
+          test "$http_code" = "200"
+
+          python - <<'PY'
+          import json
+          with open('cf-token-verify.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          if not data.get('success'):
+              raise SystemExit('Cloudflare token verify failed')
+          result = data.get('result') or {}
+          if result.get('status') != 'active':
+              raise SystemExit(f"Cloudflare token is not active: {result.get('status')}")
+          print('Cloudflare token verify OK')
+          PY
+
+      - name: Verify Cloudflare zone access by root domain
+        env:
+          CF_Token: ${{ secrets.CF_DNS_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLEAN_CF_TOKEN="$(printf '%s' "$CF_Token" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+          http_code=$(curl -sS \
+            -G \
+            -o cf-zone-lookup.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer $CLEAN_CF_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-urlencode "name=$ROOT_DOMAIN" \
+            --data-urlencode "status=active" \
+            "https://api.cloudflare.com/client/v4/zones")
+
+          echo "Cloudflare zone lookup HTTP status: $http_code"
+          cat cf-zone-lookup.json
+          test "$http_code" = "200"
+
+          python - <<'PY'
+          import json
+          with open('cf-zone-lookup.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          if not data.get('success'):
+              raise SystemExit('Cloudflare zone lookup failed')
+          result = data.get('result') or []
+          if not result:
+              raise SystemExit('No active Cloudflare zone found for ROOT_DOMAIN')
+          print('Cloudflare zone lookup OK')
+          print(result[0].get('name'), result[0].get('id'))
+          PY
+
+      - name: Register ZeroSSL account
+        env:
+          ZEROSSL_EAB_KID: ${{ secrets.ZEROSSL_EAB_KID }}
+          ZEROSSL_EAB_HMAC_KEY: ${{ secrets.ZEROSSL_EAB_HMAC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ~/.acme.sh/acme.sh --register-account \
+            --server zerossl \
+            --eab-kid "$ZEROSSL_EAB_KID" \
+            --eab-hmac-key "$ZEROSSL_EAB_HMAC_KEY" || true
+
+          ~/.acme.sh/acme.sh --set-default-ca --server zerossl
+
+      - name: Issue or renew wildcard certificate with Cloudflare DNS via ZeroSSL
+        env:
+          CF_Token: ${{ secrets.CF_DNS_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLEAN_CF_TOKEN="$(printf '%s' "$CF_Token" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          case "$CLEAN_CF_TOKEN" in
+            Bearer\ *|bearer\ *)
+              echo "CF_DNS_API_TOKEN secret must not include the 'Bearer ' prefix."
+              exit 1
+              ;;
+          esac
+
+          export CF_Token="$CLEAN_CF_TOKEN"
+          unset CF_Account_ID
+          unset CF_Zone_ID
+
+          ~/.acme.sh/acme.sh --issue \
+            --server zerossl \
+            --dns dns_cf \
+            -d "$ROOT_DOMAIN" \
+            -d "$WILDCARD_DOMAIN" \
+            --keylength "$KEY_TYPE" \
+            --dnssleep 120 \
+            --debug 2
+
+          if [ "$KEY_TYPE" = "ec-256" ] || [ "$KEY_TYPE" = "ec-384" ]; then
+            CERT_DIR="$HOME/.acme.sh/${ROOT_DOMAIN}_ecc"
+          else
+            CERT_DIR="$HOME/.acme.sh/${ROOT_DOMAIN}"
+          fi
+
+          test -f "$CERT_DIR/fullchain.cer"
+          test -f "$CERT_DIR/${ROOT_DOMAIN}.key"
+
+          cp "$CERT_DIR/fullchain.cer" ./fullchain.pem
+          cp "$CERT_DIR/${ROOT_DOMAIN}.key" ./privkey.pem
+
+          openssl x509 -in ./fullchain.pem -noout -subject -issuer -serial -dates
+
+      - name: Verify generated certificate files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s fullchain.pem
+          test -s privkey.pem
+          openssl x509 -in fullchain.pem -noout -text >/dev/null
+          openssl pkey -in privkey.pem -noout >/dev/null
+
+      - name: Upload and deploy to clouds
+        env:
+          PYTHONPATH: .
+          CF_EDGE_API_TOKEN: ${{ secrets.CF_EDGE_API_TOKEN }}
+          CF_EDGE_ZONE_ID: ${{ secrets.CF_EDGE_ZONE_ID }}
+          ALIBABA_CLOUD_ACCESS_KEY_ID: ${{ secrets.ALIBABA_CLOUD_ACCESS_KEY_ID }}
+          ALIBABA_CLOUD_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_CLOUD_ACCESS_KEY_SECRET }}
+          TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
+          TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/main.py \
+            --config "$CONFIG_FILE" \
+            --fullchain fullchain.pem \
+            --privkey privkey.pem \
+            --output run-report.json
+
+      - name: Show run report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f run-report.json ]; then
+            python -m json.tool run-report.json
+          else
+            echo "run-report.json not found"
+          fi
+          if [ -f .state/certsync-state.json ]; then
+            python -m json.tool .state/certsync-state.json
+          else
+            echo "state file not found"
+          fi
+
+      - name: Save acme.sh cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.acme.sh
+          key: acmesh-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Save certsync state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: certsync-state-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-sync-report
+          path: |
+            run-report.json
+            .state/certsync-state.json
+            cf-token-verify.json
+            cf-zone-lookup.json
+          if-no-files-found: warn
